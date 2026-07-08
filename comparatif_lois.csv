@@ -1,0 +1,13 @@
+loi,log_likelihood,AIC,BIC,feature
+Log-normale,-101963.26,203930.52,203944.49,Flow Duration (BENIGN)
+Pareto généralisée,-102433.12,204870.25,204884.22,Flow Duration (BENIGN)
+Normale,-149102.79,298209.57,298223.55,Flow Duration (BENIGN)
+Log-normale,-111961.99,223927.99,223941.95,Flow Duration (Attaque)
+Pareto généralisée,-112261.24,224526.47,224540.44,Flow Duration (Attaque)
+Normale,-151358.73,302721.47,302735.43,Flow Duration (Attaque)
+Log-normale,-90962.34,181928.69,181942.66,Flow IAT Mean (BENIGN)
+Pareto généralisée,-91590.65,183185.31,183199.28,Flow IAT Mean (BENIGN)
+Normale,-133989.41,267982.81,267996.78,Flow IAT Mean (BENIGN)
+Log-normale,-100782.71,201569.42,201583.39,Flow IAT Mean (Attaque)
+Pareto généralisée,-101241.28,202486.56,202500.53,Flow IAT Mean (Attaque)
+Normale,-135570.88,271145.76,271159.73,Flow IAT Mean (Attaque)
