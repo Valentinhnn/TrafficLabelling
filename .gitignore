@@ -1,0 +1,6 @@
+data/*.csv
+data/*.pcap
+env/
+env_msi/
+data/
+out_sequences_v2/real_sequences_used.csv
