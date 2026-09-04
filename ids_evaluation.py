@@ -1,44 +1,3 @@
-#!/usr/bin/env python3
-"""
-ids_evaluation.py
-==================
-Évaluation applicative : est-ce que le trafic synthétique améliore
-la détection d'intrusion (IDS) ?
-
-Principe :
-1. Charger les données réelles CICIDS2017 (BENIGN + attaques)
-2. Entraîner un classifieur (Random Forest) sur données réelles seules
-3. Ré-entraîner sur données réelles + synthétiques (data augmentation)
-4. Comparer les performances (accuracy, F1, précision, rappel)
-5. Si synthétique + réel > réel seul → les données synthétiques sont utiles
-
-Le classifieur prédit : BENIGN (0) ou ATTAQUE (1)
-
-Usage :
-    # Évaluation de base (réel seul vs réel + GMM)
-    python ids_evaluation.py --data-dir data \
-        --synth-csvs flux_synthetiques_benign.csv flux_synthetiques_ddos.csv \
-        --features "Flow Duration" "Packet Length Mean" \
-        --random-state 42
-
-    # Avec tous les synthétiques disponibles
-    python ids_evaluation.py --data-dir data \
-        --synth-dir . \
-        --features "Flow Duration" "Packet Length Mean" \
-        --random-state 42
-
-Sorties :
-    ids_evaluation_results.csv    -> tableau comparatif des performances
-    ids_confusion_matrices.png    -> matrices de confusion côte à côte
-    ids_metrics_comparison.png    -> graphique comparatif des métriques
-
-CORRECTIF (vs version initiale) :
-    - Fuite de données supprimée : la matrice de confusion du scénario
-      "Réel + Synthétique" est désormais entraînée sur X_real_train + X_synth
-      uniquement (jamais sur X_real_test), au lieu de X_real complet.
-    - load_synth_csvs() traite désormais les +/-inf comme NA (cohérence avec
-      load_real_data), important après un expm1() sur du GMM/CTGAN mal clippé.
-"""
 from __future__ import annotations
 
 import os
@@ -58,9 +17,7 @@ import seaborn as sns
 warnings.filterwarnings("ignore")
 
 
-# ----------------------------------------------------------------------
-# CLI
-# ----------------------------------------------------------------------
+# Parses CLI arguments for this script.
 def parse_args():
     p = argparse.ArgumentParser(description="Évaluation IDS : réel vs réel+synthétique")
     p.add_argument("--data-dir", default="data",
@@ -85,13 +42,13 @@ def parse_args():
     return p.parse_args()
 
 
-# ----------------------------------------------------------------------
-# CHARGEMENT
-# ----------------------------------------------------------------------
+# Cleans column names: strips BOM/whitespace and collapses tabs/multiple spaces.
 def normalize_cols(cols: List[str]) -> List[str]:
     return [" ".join(str(c).strip().lstrip("\ufeff").replace("\t", " ").split()) for c in cols]
 
 
+# Loads all real CICIDS2017 CSVs, keeps the needed columns, cleans them, and
+# adds a binary label (0=BENIGN, 1=attack).
 def load_real_data(data_dir: str, features: List[str], label_col: str) -> pd.DataFrame:
     if not os.path.isdir(data_dir):
         print(f"[ERREUR] Dossier introuvable: {data_dir}", file=sys.stderr)
@@ -101,10 +58,6 @@ def load_real_data(data_dir: str, features: List[str], label_col: str) -> pd.Dat
     frames = []
     for fname in csv_files:
         try:
-            # CORRECTIF : latin1 au lieu du defaut utf-8 -> certains fichiers
-            # CICIDS2017 (ex: Thursday-...-WebAttacks) ne sont pas UTF-8
-            # valides et etaient silencieusement exclus (perte d'une classe
-            # d'attaque entiere pour l'evaluation IDS).
             df = pd.read_csv(os.path.join(data_dir, fname), low_memory=False, encoding="latin1")
             df.columns = normalize_cols(df.columns.tolist())
             frames.append(df)
@@ -133,6 +86,8 @@ def load_real_data(data_dir: str, features: List[str], label_col: str) -> pd.Dat
     return df
 
 
+# Loads synthetic CSVs, infers a binary label per file (from column or filename),
+# cleans the data, and concatenates everything into one DataFrame.
 def load_synth_csvs(paths: List[str], features: List[str]) -> pd.DataFrame:
     frames = []
     for path in paths:
@@ -158,8 +113,6 @@ def load_synth_csvs(paths: List[str], features: List[str]) -> pd.DataFrame:
                 continue
 
             df = df[feat_present + ["label_binary"]]
-            # CORRECTIF : traiter +/-inf comme NA avant dropna, comme pour le réel
-            # (important après expm1() sur des queues mal clippées)
             df[feat_present] = df[feat_present].replace([np.inf, -np.inf], np.nan)
             df = df.dropna()
             df = df[(df[feat_present] >= 0).all(axis=1)]
@@ -174,6 +127,7 @@ def load_synth_csvs(paths: List[str], features: List[str]) -> pd.DataFrame:
     return pd.concat(frames, ignore_index=True)
 
 
+# Lists all "flux_synthetiques_*.csv" files in a directory.
 def find_synth_csvs(synth_dir: str) -> List[str]:
     return [
         os.path.join(synth_dir, f)
@@ -182,9 +136,7 @@ def find_synth_csvs(synth_dir: str) -> List[str]:
     ]
 
 
-# ----------------------------------------------------------------------
-# CLASSIFICATION
-# ----------------------------------------------------------------------
+# Builds a balanced Random Forest classifier.
 def build_classifier(n_estimators: int, random_state: int) -> RandomForestClassifier:
     return RandomForestClassifier(
         n_estimators=n_estimators,
@@ -194,6 +146,7 @@ def build_classifier(n_estimators: int, random_state: int) -> RandomForestClassi
     )
 
 
+# Runs stratified cross-validation and averages accuracy/f1/precision/recall.
 def evaluate_cv(X: np.ndarray, y: np.ndarray,
                 clf, cv_folds: int, random_state: int) -> Dict:
     cv = StratifiedKFold(n_splits=cv_folds, shuffle=True, random_state=random_state)
@@ -209,19 +162,17 @@ def evaluate_cv(X: np.ndarray, y: np.ndarray,
     }
 
 
+# Trains on the train split and returns the confusion matrix on the test split.
 def train_and_get_cm(X_train: np.ndarray, y_train: np.ndarray,
                      X_test: np.ndarray, y_test: np.ndarray,
                      clf) -> np.ndarray:
-    """Entraîne et retourne la matrice de confusion sur le jeu de test."""
     clf_copy = type(clf)(**clf.get_params())
     clf_copy.fit(X_train, y_train)
     y_pred = clf_copy.predict(X_test)
     return confusion_matrix(y_test, y_pred)
 
 
-# ----------------------------------------------------------------------
-# FIGURES
-# ----------------------------------------------------------------------
+# Plots one confusion matrix heatmap per scenario, side by side, and saves as PNG.
 def plot_confusion_matrices(cms: Dict[str, np.ndarray], output_path: str):
     n = len(cms)
     fig, axes = plt.subplots(1, n, figsize=(5 * n, 4))
@@ -241,6 +192,7 @@ def plot_confusion_matrices(cms: Dict[str, np.ndarray], output_path: str):
     print(f"[INFO] Matrices de confusion -> {output_path}")
 
 
+# Plots a grouped bar chart comparing accuracy/f1/precision/recall across scenarios.
 def plot_metrics_comparison(results_df: pd.DataFrame, output_path: str):
     metrics = ["accuracy", "f1", "precision", "recall"]
     x = np.arange(len(results_df))
@@ -261,9 +213,8 @@ def plot_metrics_comparison(results_df: pd.DataFrame, output_path: str):
     print(f"[INFO] Graphique comparatif -> {output_path}")
 
 
-# ----------------------------------------------------------------------
-# MAIN
-# ----------------------------------------------------------------------
+# Entry point: load real (+ optional synthetic) data, cross-validate a classifier
+# on "real only" vs "real + synthetic", compare metrics, and save figures/results.
 def main():
     args = parse_args()
     np.random.seed(args.random_state)
@@ -272,7 +223,6 @@ def main():
     features = normalize_cols(args.features)
     label_col = args.label_col.strip()
 
-    # --- Chargement données réelles ---
     print("=== Chargement données réelles ===")
     real_df = load_real_data(args.data_dir, features, label_col)
 
@@ -284,7 +234,6 @@ def main():
     print(f"  BENIGN  : {(real_df['label_binary'] == 0).sum()}")
     print(f"  Attaque : {(real_df['label_binary'] == 1).sum()}\n")
 
-    # --- Chargement données synthétiques ---
     synth_paths = []
     if args.synth_dir is not None:
         synth_paths = find_synth_csvs(args.synth_dir)
@@ -301,7 +250,6 @@ def main():
             print(f"  BENIGN synth  : {(synth_df['label_binary'] == 0).sum()}")
             print(f"  Attaque synth : {(synth_df['label_binary'] == 1).sum()}\n")
 
-    # --- Split fixe réel (utilisé pour CM dans tous les scénarios) ---
     X_real = real_df[features].values
     y_real = real_df["label_binary"].values
 
@@ -309,7 +257,6 @@ def main():
         X_real, y_real, test_size=0.2, random_state=args.random_state, stratify=y_real
     )
 
-    # --- Préparation des scénarios (pour la CV, sur l'ensemble des données dispo) ---
     scenarios = {"Réel seul": (X_real, y_real)}
 
     X_synth, y_synth = None, None
@@ -327,7 +274,6 @@ def main():
             print(f"[INFO] Scénario augmenté : {len(X_aug)} lignes total "
                   f"({len(X_real)} réels + {len(X_synth)} synthétiques)")
 
-    # --- Évaluation ---
     clf = build_classifier(args.n_estimators, args.random_state)
 
     print(f"\n=== Évaluation par validation croisée ({args.cv_folds} folds) ===")
@@ -338,8 +284,6 @@ def main():
         print(f"\n--- {scenario_name} ---")
         print(f"    {len(X)} lignes, {y.sum()} attaques ({100*y.mean():.1f}%)")
 
-        # Validation croisée (sur l'ensemble complet du scénario, pas de fuite :
-        # cross_validate refait ses propres splits internes)
         metrics = evaluate_cv(X, y, clf, args.cv_folds, args.random_state)
         print(f"    Accuracy  : {metrics['accuracy']:.4f} (±{metrics['accuracy_std']:.4f})")
         print(f"    F1        : {metrics['f1']:.4f} (±{metrics['f1_std']:.4f})")
@@ -349,9 +293,6 @@ def main():
         metrics["scenario"] = scenario_name
         results.append(metrics)
 
-        # --- Matrice de confusion : CORRECTIF fuite de données ---
-        # On entraîne uniquement sur X_real_train (+ synth si dispo pour ce
-        # scénario), jamais sur X_real_test, puis on teste sur X_real_test.
         if "Synthétique" in scenario_name and X_synth is not None:
             X_train_cm = np.vstack([X_real_train, X_synth])
             y_train_cm = np.concatenate([y_real_train, y_synth])
@@ -366,7 +307,6 @@ def main():
         print(f"      TN={cm[0,0]:5d}  FP={cm[0,1]:5d}")
         print(f"      FN={cm[1,0]:5d}  TP={cm[1,1]:5d}")
 
-    # --- Résultats ---
     results_df = pd.DataFrame(results)
     col_order = ["scenario", "accuracy", "accuracy_std", "f1", "f1_std",
                  "precision", "recall"]
@@ -379,7 +319,6 @@ def main():
     print("\n=== Tableau récapitulatif ===")
     print(results_df.to_string(index=False))
 
-    # Verdict
     if len(results_df) >= 2:
         f1_reel = results_df.loc[results_df["scenario"] == "Réel seul", "f1"].values
         f1_aug = results_df.loc[results_df["scenario"] == "Réel + Synthétique", "f1"].values
@@ -394,7 +333,6 @@ def main():
             else:
                 print("  -> Le synthétique n'a pas d'impact significatif (~0) ⚠️")
 
-    # Figures
     cm_path = os.path.join(args.output_dir, "ids_confusion_matrices.png")
     plot_confusion_matrices(cms, cm_path)
 

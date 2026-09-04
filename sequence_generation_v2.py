@@ -1,42 +1,3 @@
-#!/usr/bin/env python3
-"""
-sequence_generation_v2.py
-===========================
-Version révisée des étapes 5-7, suite au diagnostic du premier run LSTM
-(cf. lstm_temporal_generation.py) :
-
-    Constat sur les VRAIES données (sequences_host_pair.csv) : la
-    corrélation lag-1 des 7 features continues au sein d'une même séquence
-    host_pair est quasi nulle partout (0.02 à 0.05 en valeur absolue, cf.
-    run précédent). Autrement dit : la valeur d'un flow ne dépend
-    quasiment pas du flow précédent dans la même conversation. Le premier
-    LSTM multivarié (features + delta_t ensemble) inventait au contraire
-    une corrélation artificielle jusqu'à 0.44 -- un artefact classique d'un
-    état caché qui évolue en douceur, PAS un signal réel. Ce n'était donc
-    pas plus fidèle au réel, au contraire.
-
-DÉCISION (architecture simplifiée, plus proche du réel) :
-    - Les 7 FEATURES sont tirées i.i.d. (indépendamment, sans mémoire) du
-      stock CTGAN déjà entraîné et validé en partie 1 -- comme il n'y a pas
-      de dépendance flow->flow réelle à capturer sur ces colonnes, ne pas en
-      inventer une est le choix le plus fidèle aux données.
-    - Seul le DELTA_T (timing entre flows consécutifs d'une séquence) reçoit
-      un modèle temporel (petit LSTM mono-variable), car c'est la seule
-      dimension où une vraie structure (bursts/idle) est plausible. Le script
-      calcule et affiche l'autocorrélation réelle du delta_t AVANT
-      d'entraîner quoi que ce soit, pour vérifier que ce choix est justifié
-      par les données plutôt que supposé.
-
-Prérequis : CTGAN déjà entraîné et sauvegardé (gan_train_generate.py).
-
-Usage :
-    python3 sequence_generation_v2.py \
-        --sequences-csv out_sequences/sequences_host_pair.csv \
-        --ctgan-model-path ctgan_model_mv.pkl \
-        --epochs 50 --hidden-dim 32 \
-        --n-synthetic-sequences 2000 \
-        --output-dir out_sequences_v2 | tee sequence_generation_v2.log
-"""
 from __future__ import annotations
 
 import os
@@ -65,9 +26,7 @@ FEATURES = [
 DEFAULT_RANDOM_STATE = 42
 
 
-# ----------------------------------------------------------------------
-# NETTOYAGE INF/NAN (Flow Bytes/s, Flow Packets/s -> inf quand Flow Duration=0)
-# ----------------------------------------------------------------------
+# Replaces +/-inf with the max finite value in the column, and NaN with 0.
 def clean_inf_nan(df: pd.DataFrame, cols: List[str], label: str = "") -> pd.DataFrame:
     df = df.copy()
     n_inf_total = 0
@@ -91,9 +50,7 @@ def clean_inf_nan(df: pd.DataFrame, cols: List[str], label: str = "") -> pd.Data
     return df
 
 
-# ----------------------------------------------------------------------
-# CLI
-# ----------------------------------------------------------------------
+# Parses CLI arguments for this script.
 def parse_args():
     p = argparse.ArgumentParser(description="Génération de séquences : features i.i.d. CTGAN + LSTM mono-variable sur delta_t")
     p.add_argument("--sequences-csv", required=True)
@@ -150,9 +107,9 @@ def parse_args():
     return args
 
 
-# ----------------------------------------------------------------------
-# CHARGEMENT DES SÉQUENCES RÉELLES
-# ----------------------------------------------------------------------
+# Loads the sequences CSV, sorts by seq_id/position, drops too-short sequences,
+# and splits too-long ones into chunks. Returns the list of sequence DataFrames
+# plus a single concatenated DataFrame of everything kept.
 def load_real_sequences(csv_path: str, min_seq_len: int, max_train_seq_len: int) -> Tuple[List[pd.DataFrame], pd.DataFrame]:
     df = pd.read_csv(csv_path)
     missing = [c for c in ["seq_id", "position_in_seq", "delta_t_seconds"] + FEATURES if c not in df.columns]
@@ -187,19 +144,12 @@ def load_real_sequences(csv_path: str, min_seq_len: int, max_train_seq_len: int)
     return sequences, real_used
 
 
-# ----------------------------------------------------------------------
-# DIAGNOSTIC PRÉALABLE : autocorrélation réelle du delta_t
-# ----------------------------------------------------------------------
+# Computes the average lag-1 autocorrelation of log1p(delta_t) across sequences,
+# to check whether delta_t is worth modeling with a temporal model at all.
 def diagnose_delta_t_autocorr(sequences: List[pd.DataFrame]) -> float:
-    """
-    Calcule l'autocorrélation lag-1 du delta_t (en log1p) au sein de chaque
-    séquence, moyennée sur toutes les séquences valides (>=3 delta_t non-NaN
-    consécutifs). Sert à justifier -- ou invalider -- le choix d'un modèle
-    temporel pour delta_t avant d'investir du temps d'entraînement dessus.
-    """
     corrs = []
     for seq in sequences:
-        dt = seq["delta_t_seconds"].values[1:]  # position 0 = NaN, exclu
+        dt = seq["delta_t_seconds"].values[1:]
         if len(dt) < 3:
             continue
         dt_log = np.log1p(np.clip(dt, 0, None))
@@ -218,14 +168,13 @@ def diagnose_delta_t_autocorr(sequences: List[pd.DataFrame]) -> float:
     return mean_corr
 
 
-# ----------------------------------------------------------------------
-# SCALER MONO-VARIABLE (delta_t uniquement)
-# ----------------------------------------------------------------------
+# Standardizes delta_t in log1p space (mean/std computed from the real data).
 class DeltaTScaler:
     def __init__(self):
         self.mean_ = 0.0
         self.std_ = 1.0
 
+    # Computes mean/std of log1p(delta_t) over all sequences.
     def fit(self, sequences: List[pd.DataFrame]):
         all_dt = []
         for seq in sequences:
@@ -237,18 +186,22 @@ class DeltaTScaler:
         self.std_ = float(log_dt.std()) if log_dt.std() > 1e-9 else 1.0
         return self
 
+    # Raw seconds -> standardized log space.
     def transform(self, raw_value: float) -> float:
         v = max(float(raw_value), 0.0)
         return (np.log1p(v) - self.mean_) / self.std_
 
+    # Standardized log space -> raw seconds.
     def inverse_transform(self, z: float) -> float:
         logv = min(z * self.std_ + self.mean_, 50.0)
         return float(np.expm1(logv))
 
+    # Exports mean/std for serialization.
     def save(self) -> dict:
         return {"mean": self.mean_, "std": self.std_}
 
     @staticmethod
+    # Rebuilds a scaler from a saved mean/std dict.
     def load(payload: dict) -> "DeltaTScaler":
         s = DeltaTScaler()
         s.mean_ = payload["mean"]
@@ -256,8 +209,8 @@ class DeltaTScaler:
         return s
 
 
+# Builds one normalized delta_t vector per sequence, ready for LSTM training.
 def build_training_tensors(sequences: List[pd.DataFrame], scaler: DeltaTScaler):
-    """Retourne une liste de vecteurs [L] (delta_t normalisé, position 1..fin de séquence)."""
     mats = []
     for seq in sequences:
         dt = seq["delta_t_seconds"].values[1:]
@@ -269,22 +222,11 @@ def build_training_tensors(sequences: List[pd.DataFrame], scaler: DeltaTScaler):
     return mats
 
 
-# ----------------------------------------------------------------------
-# MODÈLE LSTM MONO-VARIABLE
-# ----------------------------------------------------------------------
+# Imports torch/nn and caps CPU thread count for reasonable performance.
 def _import_torch():
     try:
         import torch
         import torch.nn as nn
-        # Limite le nombre de threads CPU utilisés par PyTorch. Pour un
-        # petit modèle mono-variable (hidden_dim~32), le parallélisme par
-        # défaut de PyTorch (souvent = nombre total de coeurs, ex. 24+ sur
-        # un serveur multi-coeurs) génère plus d'overhead de synchronisation
-        # entre threads que de gain réel -- chaque opération matricielle est
-        # minuscule, donc coordonner 24 threads dessus coûte plus cher que le
-        # calcul lui-même. Observé en pratique : un run qui semblait "bloqué"
-        # avec %CPU>2000% sur un serveur à 24+ coeurs alors qu'un modèle aussi
-        # petit tourne largement plus vite avec 4 threads.
         n_threads = int(os.environ.get("TORCH_NUM_THREADS", "4"))
         torch.set_num_threads(n_threads)
         return torch, nn
@@ -293,6 +235,7 @@ def _import_torch():
         raise
 
 
+# Builds a single-variable (delta_t only) LSTM: one LSTM layer + linear output head.
 def build_model(hidden_dim: int, num_layers: int, torch, nn):
     class DeltaTLSTM(nn.Module):
         def __init__(self):
@@ -300,12 +243,14 @@ def build_model(hidden_dim: int, num_layers: int, torch, nn):
             self.lstm = nn.LSTM(1, hidden_dim, num_layers=num_layers, batch_first=True)
             self.head = nn.Linear(hidden_dim, 1)
 
+        # Full-sequence forward pass (training), handles variable lengths via padding.
         def forward(self, x, lengths):
             packed = nn.utils.rnn.pack_padded_sequence(x, lengths, batch_first=True, enforce_sorted=False)
             out_packed, _ = self.lstm(packed)
             out, _ = nn.utils.rnn.pad_packed_sequence(out_packed, batch_first=True)
             return self.head(out)
 
+        # Single-step forward pass (autoregressive generation), keeps hidden state.
         def step(self, x_t, hidden):
             out, hidden = self.lstm(x_t, hidden)
             return self.head(out), hidden
@@ -313,6 +258,7 @@ def build_model(hidden_dim: int, num_layers: int, torch, nn):
     return DeltaTLSTM()
 
 
+# Trains the delta_t LSTM with padded batches and a masked MSE loss (padding excluded).
 def train_lstm(mats: List[np.ndarray], hidden_dim: int, num_layers: int,
                 epochs: int, batch_size: int, lr: float, random_state: int):
     torch, nn = _import_torch()
@@ -364,12 +310,14 @@ def train_lstm(mats: List[np.ndarray], hidden_dim: int, num_layers: int,
     return model
 
 
+# Saves model weights + scaler + architecture params to disk.
 def save_lstm(model, scaler: DeltaTScaler, hidden_dim: int, num_layers: int, model_path: str, torch):
     torch.save({"state_dict": model.state_dict(), "scaler": scaler.save(),
                 "hidden_dim": hidden_dim, "num_layers": num_layers}, model_path)
     print(f"[INFO] Modèle LSTM (delta_t) sauvegardé -> {model_path}")
 
 
+# Reloads a saved model + scaler, ready for inference.
 def load_lstm(model_path: str, torch, nn):
     payload = torch.load(model_path, map_location="cpu")
     model = build_model(payload["hidden_dim"], payload["num_layers"], torch, nn)
@@ -379,9 +327,7 @@ def load_lstm(model_path: str, torch, nn):
     return model, scaler
 
 
-# ----------------------------------------------------------------------
-# STOCK CTGAN (features tirées i.i.d.)
-# ----------------------------------------------------------------------
+# Converts CTGAN's log1p output back to raw feature values and clips to the fit caps.
 def postprocess_ctgan(synth: pd.DataFrame, features: List[str], caps: dict) -> pd.DataFrame:
     out = synth[features].copy()
     SAFE_EXP_MAX = 700.0
@@ -395,6 +341,7 @@ def postprocess_ctgan(synth: pd.DataFrame, features: List[str], caps: dict) -> p
     return out
 
 
+# Loads a pretrained CTGAN model and samples a stock of i.i.d. synthetic feature rows.
 def load_ctgan_stock(ctgan_model_path: str, stock_size: int, random_state: int) -> pd.DataFrame:
     with open(ctgan_model_path, "rb") as f:
         payload = pickle.load(f)
@@ -417,33 +364,16 @@ def load_ctgan_stock(ctgan_model_path: str, stock_size: int, random_state: int) 
     return stock.reset_index(drop=True)
 
 
-# ----------------------------------------------------------------------
-# GÉNÉRATION
-# ----------------------------------------------------------------------
+# Generates n_synthetic sequences: features drawn i.i.d. from the CTGAN stock,
+# delta_t either rolled out from the LSTM or bootstrapped from real values.
 def generate_synthetic_sequences(mode: str, model, scaler: DeltaTScaler, stock: pd.DataFrame,
                                   real_sequences: List[pd.DataFrame], n_synthetic: int,
                                   random_state: int, torch=None, nn=None, delta_t_noise_std: float = 0.0):
-    """
-    Pour chaque séquence synthétique :
-      - longueur tirée par bootstrap sur les longueurs réelles.
-      - position 0 : un flow tiré i.i.d. du stock CTGAN (delta_t = NaN, comme
-        dans les vraies séquences -- pas de prédécesseur).
-      - positions suivantes : features tirées i.i.d. du stock CTGAN,
-        INDÉPENDAMMENT de l'historique (cohérent avec l'absence de
-        corrélation flow->flow observée dans les vraies données).
-        delta_t généré selon --delta-t-mode :
-          * "lstm" : rollout autorégressif du LSTM mono-variable.
-          * "iid"  : bootstrap direct dans la distribution empirique réelle
-            du delta_t, indépendamment à chaque pas -- à utiliser si le
-            diagnostic préalable montre que le delta_t n'a lui non plus pas
-            de structure temporelle réelle à capturer.
-    """
     rng = np.random.default_rng(random_state)
     real_lengths = [len(s) for s in real_sequences]
     stock_arr = stock[FEATURES].values
     n_stock = len(stock_arr)
 
-    # pool pour le mode iid : toutes les vraies valeurs de delta_t (hors position 0)
     real_dt_pool = np.concatenate([
         np.clip(s["delta_t_seconds"].values[1:], 0, None) for s in real_sequences if len(s) > 1
     ])
@@ -458,7 +388,6 @@ def generate_synthetic_sequences(mode: str, model, scaler: DeltaTScaler, stock: 
         for seq_idx in range(n_synthetic):
             target_len = int(rng.choice(real_lengths))
 
-            # position 0 : flow i.i.d., pas de delta_t
             first_idx = rng.integers(0, n_stock)
             seq_rows = [{"position_in_seq": 0, "delta_t_seconds": np.nan,
                          **{c: float(stock_arr[first_idx, i]) for i, c in enumerate(FEATURES)}}]
@@ -466,9 +395,6 @@ def generate_synthetic_sequences(mode: str, model, scaler: DeltaTScaler, stock: 
             hidden = None
             x_t = None
             if mode == "lstm":
-                # init du delta_t : bootstrap sur une vraie 1ère valeur de delta_t
-                # (position 1) d'une séquence réelle, pour démarrer le rollout
-                # dans une zone plausible plutôt qu'à zéro.
                 init_seq = real_sequences[int(rng.integers(0, len(real_sequences)))]
                 init_dt_series = init_seq["delta_t_seconds"].values[1:]
                 init_dt = float(init_dt_series[0]) if len(init_dt_series) else 0.0
@@ -479,15 +405,12 @@ def generate_synthetic_sequences(mode: str, model, scaler: DeltaTScaler, stock: 
                     pred, hidden = model.step(x_t, hidden)
                     z = float(pred.view(-1).item())
                     if delta_t_noise_std > 0:
-                        # échantillonnage autour de la moyenne prédite -- corrige le biais de
-                        # Jensen (expm1 convexe) qui sous-estime fortement la moyenne réelle en
-                        # secondes si on repasse bêtement le point moyen prédit en espace log.
                         z = z + rng.normal(0.0, delta_t_noise_std)
                     delta_t_synth = max(scaler.inverse_transform(z), 0.0)
                 else:
                     delta_t_synth = float(rng.choice(real_dt_pool))
 
-                feat_idx = rng.integers(0, n_stock)  # tirage i.i.d., indépendant de l'historique
+                feat_idx = rng.integers(0, n_stock)
                 seq_rows.append({
                     "position_in_seq": pos,
                     "delta_t_seconds": delta_t_synth,
@@ -506,9 +429,7 @@ def generate_synthetic_sequences(mode: str, model, scaler: DeltaTScaler, stock: 
     return out_df
 
 
-# ----------------------------------------------------------------------
-# VALIDATION
-# ----------------------------------------------------------------------
+# Average lag-1 correlation of `col` within each sequence (measures flow->flow dependency).
 def lag1_corr_within_sequences(df: pd.DataFrame, col: str) -> float:
     vals = []
     for _, g in df.groupby("seq_id", sort=False):
@@ -520,6 +441,8 @@ def lag1_corr_within_sequences(df: pd.DataFrame, col: str) -> float:
     return float(np.mean(vals)) if vals else float("nan")
 
 
+# Prints real-vs-synthetic comparison: delta_t distribution, feature distributions,
+# and lag-1 autocorrelations, for a quick sanity check.
 def validate(real_used: pd.DataFrame, synth: pd.DataFrame):
     print("\n=== Validation ===")
 
@@ -552,9 +475,8 @@ def validate(real_used: pd.DataFrame, synth: pd.DataFrame):
         print(f"{col:22s} : réel={r_corr:.4f} | synth={s_corr:.4f}")
 
 
-# ----------------------------------------------------------------------
-# MAIN
-# ----------------------------------------------------------------------
+# Entry point: load real sequences, diagnose delta_t autocorrelation, train/load
+# the LSTM (or skip it in iid mode), generate synthetic sequences, validate, and save.
 def main():
     args = parse_args()
     os.makedirs(args.output_dir, exist_ok=True)

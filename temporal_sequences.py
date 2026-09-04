@@ -1,27 +1,3 @@
-#!/usr/bin/env python3
-"""
-temporal_sequences.py
-======================
-Étapes 1-2 du pipeline dépendances temporelles : tri chronologique des flows
-BENIGN de CICIDS2017 et construction des séquences (par paire d'hôtes,
-par 5-tuple, ou par fenêtres temporelles fixes), avec calcul des
-inter-arrival times (delta_t).
-
-Sortie utilisée ensuite par le fit Hawkes (delta_t globaux/par groupe) et
-par l'entraînement LSTM/GRU (séquences de features + delta_t).
-
-Usage:
-    python3 temporal_sequences.py --data-dir data --group-by host_pair \
-        --min-seq-len 5 --output-dir out_sequences | tee temporal_sequences.log
-
-CORRECTIFS/CONVENTIONS reprises du reste du pipeline :
-    - lecture CSV en encoding="latin1" (cf. bug encodage documenté dans
-      synthetic_generation.py / copula_generation.py / gan_train_generate.py).
-    - normalize_cols() pour gérer BOM/espaces/tabs dans les en-têtes,
-      identique aux autres scripts.
-    - comparaison Label en BENIGN via strip + upper (même correctif que
-      stats_features.py).
-"""
 from __future__ import annotations
 
 import os
@@ -44,8 +20,6 @@ DEFAULT_FEATURES = [
     "Packet Length Std",
 ]
 
-# Noms candidats pour les colonnes d'identification (CICIDS2017 a des
-# variantes de nommage selon les fichiers/versions du dataset).
 CANDIDATE_COLS = {
     "timestamp": ["Timestamp"],
     "src_ip": ["Source IP", "Src IP", "SourceIP"],
@@ -57,21 +31,20 @@ CANDIDATE_COLS = {
 }
 
 
-# ----------------------------------------------------------------------
-# UTILITAIRES (repris des autres scripts du pipeline)
-# ----------------------------------------------------------------------
+# Cleans column names: strips BOM/whitespace and collapses tabs/multiple spaces.
 def normalize_cols(cols: list) -> list:
     return [" ".join(str(c).strip().lstrip("\ufeff").replace("\t", " ").split()) for c in cols]
 
 
+# Finds which candidate column name is actually present for a given role.
 def resolve_col(df_cols: List[str], candidates: List[str], role: str) -> Optional[str]:
-    """Trouve la colonne réelle correspondant à un rôle (timestamp, src_ip, ...)."""
     for cand in candidates:
         if cand in df_cols:
             return cand
     return None
 
 
+# Lists CSV files in a directory, raises if none found.
 def find_csv_files(data_dir: str) -> List[str]:
     files = sorted(f for f in os.listdir(data_dir) if f.lower().endswith(".csv"))
     if not files:
@@ -79,19 +52,14 @@ def find_csv_files(data_dir: str) -> List[str]:
     return files
 
 
-# ----------------------------------------------------------------------
-# CHARGEMENT
-# ----------------------------------------------------------------------
+# Loads all CSVs, resolves the id/feature columns, keeps only BENIGN flows,
+# and drops rows with missing/empty source or destination IP.
 def load_benign_with_ids(data_dir: str, features: List[str]) -> pd.DataFrame:
-    """
-    Charge tous les CSV, filtre BENIGN, conserve les colonnes d'identification
-    (timestamp, IPs, ports, protocole) + les features continues.
-    """
     csv_files = find_csv_files(data_dir)
     print(f"[INFO] {len(csv_files)} fichiers CSV trouvés dans '{data_dir}', chargement...")
 
     frames = []
-    resolved = None  # noms de colonnes résolus, déterminés sur le 1er fichier valide
+    resolved = None
 
     for fname in csv_files:
         fpath = os.path.join(data_dir, fname)
@@ -140,10 +108,6 @@ def load_benign_with_ids(data_dir: str, features: List[str]) -> pd.DataFrame:
     df = df.loc[is_benign].drop(columns=[label_col]).reset_index(drop=True)
     print(f"\n[INFO] {len(df)} flows BENIGN conservés (sur le total chargé)")
 
-    # VALIDATION : IPs manquantes/vides -> auraient sinon créé de faux groupes
-    # "nan__nan" ou "x__x" lors du groupement par paire (astype(str) transforme
-    # NaN en la chaîne littérale "nan", et pandas min/max(axis=1, skipna=True)
-    # collapse une paire avec une IP manquante sur l'IP restante).
     src_col, dst_col = resolved["src_ip"], resolved["dst_ip"]
     n_before = len(df)
     bad_ip_mask = (
@@ -160,21 +124,12 @@ def load_benign_with_ids(data_dir: str, features: List[str]) -> pd.DataFrame:
     return df, resolved
 
 
-# ----------------------------------------------------------------------
-# ÉTAPE 1 : TRI TEMPOREL
-# ----------------------------------------------------------------------
+# Parses timestamps by trying known exact formats first, then a slower flexible
+# parser as a fallback for whatever doesn't match.
 def parse_timestamps_robust(series: pd.Series) -> pd.Series:
-    """
-    Parse une colonne Timestamp CICIDS2017 en essayant plusieurs formats connus
-    successivement (le dataset mélange des formats selon les fichiers, ex.
-    '03/07/2017 08:55:58' vs '4/7/2017 8:54' -> l'inférence automatique de
-    pd.to_datetime peut échouer sur des colonnes non-homogènes selon la version
-    de pandas). Les lignes non résolues après les formats explicites passent
-    par un dernier essai en parsing flexible (dateutil, plus lent mais tolérant).
-    """
     candidate_formats = [
-        "%d/%m/%Y %H:%M:%S",  # ex. 03/07/2017 08:55:58 (Monday)
-        "%d/%m/%Y %H:%M",     # ex. 4/7/2017 8:54 (Tuesday et autres)
+        "%d/%m/%Y %H:%M:%S",
+        "%d/%m/%Y %H:%M",
     ]
     result = pd.Series(pd.NaT, index=series.index, dtype="datetime64[ns]")
     remaining = pd.Series(True, index=series.index)
@@ -187,13 +142,13 @@ def parse_timestamps_robust(series: pd.Series) -> pd.Series:
         remaining = result.isna()
 
     if remaining.any():
-        # dernier recours, plus lent : parsing flexible sur ce qui reste seulement
         parsed = pd.to_datetime(series[remaining], dayfirst=True, errors="coerce")
         result.loc[remaining] = parsed
 
     return result
 
 
+# Parses the timestamp column, drops unparseable rows, and sorts chronologically.
 def parse_and_sort(df: pd.DataFrame, ts_col: str) -> pd.DataFrame:
     df["_ts"] = parse_timestamps_robust(df[ts_col])
     n_nat = df["_ts"].isna().sum()
@@ -205,16 +160,11 @@ def parse_and_sort(df: pd.DataFrame, ts_col: str) -> pd.DataFrame:
     return df
 
 
-# ----------------------------------------------------------------------
-# ÉTAPE 2 : CONSTRUCTION DES SÉQUENCES
-# ----------------------------------------------------------------------
+# Groups flows by unordered (src_ip, dst_ip) pair, i.e. one sequence per conversation
+# regardless of port/protocol/direction.
 def build_host_pair_sequences(df: pd.DataFrame, resolved: dict, features: List[str],
                                min_seq_len: int) -> pd.DataFrame:
-    """Groupe par paire (src_ip, dst_ip) non-ordonnée -> plus de flows par groupe
-    que le 5-tuple strict (regroupe toute la conversation, tous ports/protocoles
-    confondus)."""
     src_col, dst_col = resolved["src_ip"], resolved["dst_ip"]
-    # paire non-ordonnée : (min(ip1,ip2), max(ip1,ip2)) pour regrouper les deux sens
     pair_a = df[[src_col, dst_col]].min(axis=1)
     pair_b = df[[src_col, dst_col]].max(axis=1)
     df = df.copy()
@@ -223,6 +173,7 @@ def build_host_pair_sequences(df: pd.DataFrame, resolved: dict, features: List[s
     return _finalize_sequences(df, features, min_seq_len, group_label="host_pair", keep_label=True)
 
 
+# Groups flows by strict 5-tuple (src/dst IP, src/dst port, protocol).
 def build_five_tuple_sequences(df: pd.DataFrame, resolved: dict, features: List[str],
                                 min_seq_len: int) -> pd.DataFrame:
     cols = [resolved["src_ip"], resolved["dst_ip"]]
@@ -235,6 +186,7 @@ def build_five_tuple_sequences(df: pd.DataFrame, resolved: dict, features: List[
     return _finalize_sequences(df, features, min_seq_len, group_label="five_tuple", keep_label=True)
 
 
+# Groups flows into fixed-size time windows, independent of source/destination.
 def build_time_window_sequences(df: pd.DataFrame, features: List[str],
                                  window_seconds: int, min_seq_len: int) -> pd.DataFrame:
     df = df.copy()
@@ -244,6 +196,8 @@ def build_time_window_sequences(df: pd.DataFrame, features: List[str],
     return _finalize_sequences(df, features, min_seq_len, group_label="time_window", keep_label=False)
 
 
+# Shared logic for all group-by modes: filters groups below min_seq_len, computes
+# delta_t and position_in_seq within each group, and assigns short seq_ids.
 def _finalize_sequences(df: pd.DataFrame, features: List[str], min_seq_len: int,
                          group_label: str, keep_label: bool = False) -> pd.DataFrame:
     df = df.sort_values(["_group_id", "_ts"]).reset_index(drop=True)
@@ -260,9 +214,6 @@ def _finalize_sequences(df: pd.DataFrame, features: List[str], min_seq_len: int,
         print(f"[INFO] Taille des groupes valides : min={group_sizes[valid_groups].min()}, "
               f"median={int(group_sizes[valid_groups].median())}, max={group_sizes[valid_groups].max()}")
 
-        # DIAGNOSTIC : identité réelle des 10 plus gros groupes, pour repérer
-        # tout de suite un artefact (IP par défaut, broadcast, etc.) plutôt
-        # qu'une conversation légitime très active.
         top10 = group_sizes[valid_groups].sort_values(ascending=False).head(10)
         print(f"[DIAG] Top 10 des plus gros groupes ({group_label}) :")
         if keep_label:
@@ -273,11 +224,9 @@ def _finalize_sequences(df: pd.DataFrame, features: List[str], min_seq_len: int,
             for gid, size in top10.items():
                 print(f"       {size:>8} flows -> {gid}")
 
-    # delta_t = inter-arrival time au sein du groupe (NaN pour le 1er flow de chaque groupe)
     df["delta_t_seconds"] = df.groupby("_group_id")["_ts"].diff().dt.total_seconds()
     df["position_in_seq"] = df.groupby("_group_id").cumcount()
 
-    # renommage des groupes en identifiants séquentiels courts (seq_0000, seq_0001, ...)
     unique_groups = df["_group_id"].unique()
     remap = {g: f"seq_{i:05d}" for i, g in enumerate(unique_groups)}
     df["seq_id"] = df["_group_id"].map(remap)
@@ -291,10 +240,7 @@ def _finalize_sequences(df: pd.DataFrame, features: List[str], min_seq_len: int,
     return result
 
 
-# ----------------------------------------------------------------------
-# INTER-ARRIVAL TIMES GLOBAUX (pour le futur fit Hawkes sur le process
-# d'arrivée global des flows BENIGN, indépendamment du groupement)
-# ----------------------------------------------------------------------
+# Computes inter-arrival times across all flows globally, ignoring any grouping.
 def compute_global_interarrival(df: pd.DataFrame) -> pd.DataFrame:
     ts_sorted = df["_ts"].sort_values().reset_index(drop=True)
     delta = ts_sorted.diff().dt.total_seconds()
@@ -302,9 +248,8 @@ def compute_global_interarrival(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-# ----------------------------------------------------------------------
-# MAIN
-# ----------------------------------------------------------------------
+# Entry point: load benign flows, sort by time, group into sequences with the
+# chosen strategy, compute global inter-arrival times, and save CSVs.
 def main():
     p = argparse.ArgumentParser(description="Tri temporel + construction de séquences de flows BENIGN")
     p.add_argument("--data-dir", default="data")
@@ -323,7 +268,6 @@ def main():
     df, resolved = load_benign_with_ids(args.data_dir, features)
     df = parse_and_sort(df, resolved["timestamp"])
 
-    # inter-arrival global (utile pour Hawkes, indépendant du groupement choisi)
     global_iat = compute_global_interarrival(df)
     global_iat_path = os.path.join(args.output_dir, "global_interarrival.csv")
     global_iat.to_csv(global_iat_path, index=False)
@@ -331,8 +275,6 @@ def main():
           f"({len(global_iat)} lignes, delta_t median="
           f"{global_iat['delta_t_seconds'].median():.4f}s)")
 
-    # DIAGNOSTIC : ampleur précise de la résolution "minute" du Timestamp
-    # CICIDS2017 (impacte le choix Hawkes continu vs comptage discret par bin).
     valid_dt = global_iat["delta_t_seconds"].dropna()
     pct_zero = (valid_dt == 0).mean() * 100
     pct_below_60s = (valid_dt < 60).mean() * 100

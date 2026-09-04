@@ -1,27 +1,3 @@
-#!/usr/bin/env python3
-"""
-generate_report_figures.py
-=============================
-Étape 8 (partielle) : génère les figures de comparaison réel vs synthétique
-et un brouillon de résumé méthodologique (Markdown) pour le rapport, à
-partir des sorties de sequence_generation_v2.py.
-
-Ne dépend PAS de PyTorch/CTGAN -- juste pandas/scipy/matplotlib -- donc
-peut tourner immédiatement après la génération, sans rien recharger.
-
-Usage :
-    python3 generate_report_figures.py \
-        --real-sequences-csv out_sequences_v2/real_sequences_used.csv \
-        --synth-sequences-csv out_sequences_v2/synthetic_sequences.csv \
-        --output-dir out_sequences_v2/figures | tee report_figures.log
-
-Sorties (dans --output-dir) :
-    fig_delta_t_distribution.png     -> histogramme log(delta_t) réel vs synth
-    fig_features_distributions.png   -> grille 7 histogrammes réel vs synth
-    fig_lag1_autocorrelation.png     -> barres autocorrélation réel vs synth
-    step8_summary_draft.md           -> brouillon de résumé méthodologique
-                                         avec les vrais chiffres calculés ici
-"""
 from __future__ import annotations
 
 import os
@@ -46,6 +22,7 @@ FEATURES = [
 ]
 
 
+# Parses CLI arguments for this script.
 def parse_args():
     p = argparse.ArgumentParser(description="Figures + résumé méthodologique (étape 8)")
     p.add_argument("--real-sequences-csv", required=True)
@@ -57,6 +34,7 @@ def parse_args():
     return p.parse_args()
 
 
+# Average lag-1 correlation of `col` within each sequence.
 def lag1_corr_within_sequences(df: pd.DataFrame, col: str) -> float:
     vals = []
     for _, g in df.groupby("seq_id", sort=False):
@@ -68,10 +46,11 @@ def lag1_corr_within_sequences(df: pd.DataFrame, col: str) -> float:
     return float(np.mean(vals)) if vals else float("nan")
 
 
+# Imports matplotlib in headless mode; returns None if it isn't installed.
 def try_import_matplotlib():
     try:
         import matplotlib
-        matplotlib.use("Agg")  # pas d'affichage interactif, juste sauvegarde fichier
+        matplotlib.use("Agg")
         import matplotlib.pyplot as plt
         return plt
     except ImportError:
@@ -80,6 +59,7 @@ def try_import_matplotlib():
         return None
 
 
+# Plots real vs synthetic delta_t distributions (log1p histograms) and saves as PNG.
 def plot_delta_t(plt, real_dt, synth_dt, output_dir):
     fig, ax = plt.subplots(figsize=(7, 4.5))
     bins = np.linspace(0, np.log1p(max(real_dt.max(), synth_dt.max(), 1)), 60)
@@ -96,6 +76,7 @@ def plot_delta_t(plt, real_dt, synth_dt, output_dir):
     print(f"[INFO] Figure sauvegardée -> {out_path}")
 
 
+# Plots real vs synthetic distributions for each feature in a 3x3 grid and saves as PNG.
 def plot_features(plt, real_used, synth, output_dir):
     fig, axes = plt.subplots(3, 3, figsize=(13, 10))
     axes = axes.flatten()
@@ -120,6 +101,7 @@ def plot_features(plt, real_used, synth, output_dir):
     print(f"[INFO] Figure sauvegardée -> {out_path}")
 
 
+# Plots a real-vs-synthetic bar chart of lag-1 autocorrelations and saves as PNG.
 def plot_autocorr(plt, corr_rows, output_dir):
     labels = [r[0] for r in corr_rows]
     real_vals = [r[1] for r in corr_rows]
@@ -143,6 +125,7 @@ def plot_autocorr(plt, corr_rows, output_dir):
     print(f"[INFO] Figure sauvegardée -> {out_path}")
 
 
+# Writes a Markdown draft summarizing the methodology and results for the report.
 def write_summary(output_dir, delta_t_mode, real_used, synth, dt_stats, feature_stats, corr_rows):
     lines = []
     lines.append("# Étape 8 — Résumé méthodologique (brouillon)\n")
@@ -220,6 +203,7 @@ def write_summary(output_dir, delta_t_mode, real_used, synth, dt_stats, feature_
     print(f"[INFO] Brouillon de résumé méthodologique -> {out_path}")
 
 
+# Entry point: load real/synth CSVs, compute stats, plot figures, and write the summary.
 def main():
     args = parse_args()
     os.makedirs(args.output_dir, exist_ok=True)

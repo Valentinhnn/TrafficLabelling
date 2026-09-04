@@ -4,3 +4,6 @@ env/
 env_msi/
 data/
 out_sequences_v2/real_sequences_used.csv
+backup_avant_commentaires/
+codes_a_commenter.zip
+codes_commentes.zip

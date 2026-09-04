@@ -1,44 +1,3 @@
-#!/usr/bin/env python3
-"""
-gan_train_generate.py
-======================
-Génération de trafic réseau synthétique (CICIDS2017) par CTGAN.
-Pendant direct de synthetic_generation.py (GMM), avec la même logique
-de chargement, preprocessing, validation et export.
-
-Prérequis :
-    pip install ctgan torch
-
-Usage exemple :
-    python gan_train_generate.py --data-dir data --features "Flow Duration" "Packet Length Mean" \
-        --n-synthetic 5000 --epochs 300 --random-state 42
-
-Sorties :
-    flux_synthetiques_gan.csv             -> flux synthétiques générés
-    ctgan_model.pkl                       -> modèle entraîné + métadonnées (rechargeable)
-    validation_gan.csv                    -> KS/Wasserstein par feature
-    comparaison_gmm_vs_gan.csv            -> tableau comparatif si GMM disponible
-    correlation_matrices_comparaison.csv  -> comparaison des matrices de corrélation
-
-CORRECTIFS (vs version initiale) :
-    - train_ctgan : seeding explicite numpy + torch (manual_seed / cuda.manual_seed_all)
-      avant instanciation, et transmission de random_state au constructeur CTGAN si la
-      version installée le supporte (détection via inspect.signature). Sans ça,
-      --random-state n'avait aucun effet sur l'entraînement lui-même.
-    - Cache modèle (ctgan_model.pkl) : sauvegardé comme payload {ctgan, features, caps,
-      fit_clip_quantile, random_state} et validé au chargement (features identiques),
-      au lieu d'un pickle brut sans métadonnées silencieusement incompatible si les
-      --features changent entre deux runs.
-    - postprocess : le paramètre `caps` (bornes de fit-clip calculées sur les données
-      réelles) est désormais réellement appliqué en sortie, pour éviter que le GAN
-      génère des valeurs hors de la plage d'entraînement (le paramètre était mort
-      dans la version initiale).
-    - compare_gmm_vs_gan : suppression des colonnes Corr_* buguées (calculaient la
-      corrélation entre les 2 premières features du jeu, identique sur toutes les
-      lignes, avec un risque de NameError si une feature manquait des deux synthétiques
-      dès la première itération). Remplacé par compare_correlation_matrices(), qui
-      compare correctement les matrices de corrélation réel/GMM/GAN pour N features.
-"""
 from __future__ import annotations
 
 import os
@@ -55,10 +14,8 @@ from scipy.stats import ks_2samp, wasserstein_distance
 
 warnings.filterwarnings("ignore")
 
-# ----------------------------------------------------------------------
-# CLI
-# ----------------------------------------------------------------------
 
+# Parses CLI arguments for this script.
 def parse_args():
     p = argparse.ArgumentParser(description="Génération synthétique CTGAN — CICIDS2017")
     p.add_argument("--data-dir", default="data",
@@ -91,10 +48,7 @@ def parse_args():
     return p.parse_args()
 
 
-# ----------------------------------------------------------------------
-# CHARGEMENT
-# ----------------------------------------------------------------------
-
+# Cleans column names: strips BOM/whitespace and collapses tabs/multiple spaces.
 def normalize_cols(cols: List[str]) -> List[str]:
     out = []
     for c in cols:
@@ -104,6 +58,7 @@ def normalize_cols(cols: List[str]) -> List[str]:
     return out
 
 
+# Loads and concatenates all CICIDS2017 CSVs found in a directory.
 def load_all_csvs(data_dir: str) -> pd.DataFrame:
     if not os.path.isdir(data_dir):
         print(f"[ERREUR] Dossier introuvable: {data_dir}", file=sys.stderr)
@@ -119,9 +74,6 @@ def load_all_csvs(data_dir: str) -> pd.DataFrame:
     for fname in csv_files:
         fpath = os.path.join(data_dir, fname)
         try:
-            # CORRECTIF : latin1 au lieu du defaut utf-8 -> certains fichiers
-            # CICIDS2017 (ex: Thursday-...-WebAttacks) ne sont pas UTF-8
-            # valides et etaient silencieusement exclus.
             df = pd.read_csv(fpath, low_memory=False, encoding="latin1")
             df.columns = normalize_cols(df.columns.tolist())
             frames.append(df)
@@ -138,21 +90,14 @@ def load_all_csvs(data_dir: str) -> pd.DataFrame:
     return full
 
 
-# ----------------------------------------------------------------------
-# PREPROCESSING
-# ----------------------------------------------------------------------
-
+# Cleans inf/NaN, clips outliers to quantile caps, and log1p-transforms features
+# so CTGAN trains on a more Gaussian-like distribution.
 def preprocess(df: pd.DataFrame, features: List[str],
                fit_clip_quantile: float) -> tuple[pd.DataFrame, dict, pd.DataFrame]:
     data = df[features].copy()
     data = data.replace([np.inf, -np.inf], np.nan).dropna()
     data = data[(data >= 0).all(axis=1)]
 
-    # CORRECTIF : reference "reelle" nettoyee (inf/negatifs retires) mais NON
-    # clippee et NON log-transformee, a utiliser pour describe()/validate()/
-    # correlations en aval. Avant ce fix, ces etapes utilisaient benign_df
-    # brut (encore avec inf/negatifs) -> statistiques faussees (mean=inf) et
-    # Wasserstein=NaN possible sur certaines features.
     real_clean = data.copy()
 
     caps = {}
@@ -169,6 +114,7 @@ def preprocess(df: pd.DataFrame, features: List[str],
     return data, caps, real_clean
 
 
+# Reverses the log1p transform on CTGAN's output and clips back to the caps.
 def postprocess(synth: pd.DataFrame, features: List[str],
                 caps: dict, clip_max_output: float | None) -> pd.DataFrame:
     out = synth[features].copy()
@@ -178,10 +124,6 @@ def postprocess(synth: pd.DataFrame, features: List[str],
         with np.errstate(over="ignore", invalid="ignore"):
             out[col] = np.expm1(out[col])
         out[col] = out[col].clip(lower=0.0)
-        # CORRECTIF : re-borner par le cap de fit (echelle brute). Le GAN peut
-        # extrapoler au-dela de la plage d'entrainement ; on le contraint a la
-        # meme plage que les donnees reelles utilisees pour le fit, coherent
-        # avec le clip applique en amont.
         if col in caps:
             out[col] = out[col].clip(upper=caps[col])
         if clip_max_output is not None:
@@ -189,10 +131,7 @@ def postprocess(synth: pd.DataFrame, features: List[str],
     return out
 
 
-# ----------------------------------------------------------------------
-# ENTRAÎNEMENT CTGAN
-# ----------------------------------------------------------------------
-
+# Sets random seeds (python/numpy/torch) for reproducibility.
 def _seed_everything(random_state: int):
     np.random.seed(random_state)
     try:
@@ -204,6 +143,7 @@ def _seed_everything(random_state: int):
         pass
 
 
+# Trains a CTGAN model on the (log1p-transformed) real feature data.
 def train_ctgan(data: pd.DataFrame, features: List[str],
                 epochs: int, batch_size: int,
                 random_state: int, max_rows: int):
@@ -215,9 +155,6 @@ def train_ctgan(data: pd.DataFrame, features: List[str],
         print("[INFO] Installe-le dans ton venv : pip install ctgan")
         raise
 
-    # CORRECTIF : seeding explicite numpy/torch avant instanciation du CTGAN.
-    # Sans ca, --random-state n'affectait que le sous-echantillonnage, pas
-    # l'init des poids ni le bruit d'entrainement du GAN.
     _seed_everything(random_state)
 
     if len(data) > max_rows:
@@ -233,9 +170,6 @@ def train_ctgan(data: pd.DataFrame, features: List[str],
         verbose=True,
         cuda=_cuda_available(),
     )
-    # CORRECTIF : transmettre random_state au constructeur si la version
-    # installee de ctgan le supporte (le nom du parametre a varie selon les
-    # versions : random_state ou random_seed).
     sig_params = inspect.signature(CTGAN.__init__).parameters
     if "random_state" in sig_params:
         ctgan_kwargs["random_state"] = random_state
@@ -250,6 +184,7 @@ def train_ctgan(data: pd.DataFrame, features: List[str],
     return ctgan
 
 
+# Checks whether a CUDA GPU is available for torch.
 def _cuda_available() -> bool:
     try:
         import torch
@@ -258,14 +193,8 @@ def _cuda_available() -> bool:
         return False
 
 
+# Loads a previously saved CTGAN model + its quantile caps, if the file exists.
 def load_cached_ctgan(model_path: str, features: List[str]) -> Tuple[Optional[object], Optional[dict], Optional[str]]:
-    """
-    CORRECTIF : le modèle est désormais sauvegardé comme un payload avec
-    métadonnées (features, caps...) et on vérifie ici que les features du
-    modèle en cache correspondent à celles demandées, au lieu de recharger
-    aveuglément un pickle brut.
-    Retourne (ctgan, caps, erreur). ctgan est None si le cache est invalide.
-    """
     try:
         with open(model_path, "rb") as f:
             payload = pickle.load(f)
@@ -282,14 +211,12 @@ def load_cached_ctgan(model_path: str, features: List[str]) -> Tuple[Optional[ob
     return payload["ctgan"], payload.get("caps", {}), None
 
 
-# ----------------------------------------------------------------------
-# VALIDATION
-# ----------------------------------------------------------------------
-
+# Computes a few quantiles of a series, used for clipping/validation.
 def compute_quantiles(series: pd.Series, qs=(0.01, 0.05, 0.5, 0.95, 0.99)) -> dict:
     return {float(q): float(series.quantile(q)) for q in qs}
 
 
+# Prints a real-vs-synthetic comparison (KS test, Wasserstein distance, quantiles) per feature.
 def validate(real: pd.DataFrame, synth: pd.DataFrame, features: List[str], label: str = "GAN"):
     print(f"\n{'='*60}")
     print(f"  Validation univariée — {label}")
@@ -331,6 +258,7 @@ def validate(real: pd.DataFrame, synth: pd.DataFrame, features: List[str], label
     return pd.DataFrame(results)
 
 
+# Compares real vs synthetic feature correlation matrices (Frobenius distance).
 def validate_correlations(real: pd.DataFrame, synth: pd.DataFrame, features: List[str]):
     common = [c for c in features if c in real.columns and c in synth.columns]
     if not common:
@@ -342,20 +270,9 @@ def validate_correlations(real: pd.DataFrame, synth: pd.DataFrame, features: Lis
     print(synth[common].corr().to_string())
 
 
-# ----------------------------------------------------------------------
-# COMPARAISON GMM vs GAN
-# ----------------------------------------------------------------------
-
+# Compares a GMM baseline against CTGAN on distribution similarity metrics.
 def compare_gmm_vs_gan(real: pd.DataFrame, synth_gmm: pd.DataFrame,
                        synth_gan: pd.DataFrame, features: List[str]) -> pd.DataFrame:
-    """
-    CORRECTIF : suppression des colonnes Corr_* (bug : calculaient la
-    corrélation entre les 2 premières features du jeu via iloc[0,1],
-    identique sur toutes les lignes et invalide pour N>2 features ; risque
-    de NameError si une feature manquait des deux synthétiques dès la
-    première itération). La comparaison de corrélations se fait désormais
-    via compare_correlation_matrices() ci-dessous.
-    """
     print(f"\n{'='*60}")
     print("  Comparaison GMM vs GAN")
     print(f"{'='*60}")
@@ -366,10 +283,6 @@ def compare_gmm_vs_gan(real: pd.DataFrame, synth_gmm: pd.DataFrame,
         r = real[col].dropna()
         iqr = float(r.quantile(0.75) - r.quantile(0.25))
         med = float(r.median())
-        # CORRECTIF : certaines features tres discretes (Flow Bytes/s,
-        # Flow Packets/s) ont un IQR reel nul -> W/IQR est NaN pour tout
-        # modele, rendant la comparaison inutilisable. Fallback sur W/median
-        # dans ce cas, avec une colonne "metric" pour tracer lequel est utilise.
         use_median_fallback = (iqr == 0)
         row = {"feature": col, "metric": "W/median" if use_median_fallback else "W/IQR"}
         for label, synth in [("GMM", synth_gmm), ("GAN", synth_gan)]:
@@ -396,11 +309,6 @@ def compare_gmm_vs_gan(real: pd.DataFrame, synth_gmm: pd.DataFrame,
         metric = row.get("metric", "W/IQR")
         if "score_GMM" in row and "score_GAN" in row:
             v_gmm, v_gan = row["score_GMM"], row["score_GAN"]
-            # CORRECTIF : nan < nan vaut False en Python -> affichait "GAN
-            # meilleur" par defaut meme quand aucun des deux scores n'est
-            # valide (typiquement IQR reel = 0, ex: Flow Bytes/s tres discret ;
-            # d'ou le fallback W/median ci-dessus, qui elimine deja la plupart
-            # des cas, mais on garde ce garde-fou si median=0 aussi).
             if pd.isna(v_gmm) and pd.isna(v_gan):
                 print(f"  {feat} ({metric}) : GMM=nan | GAN=nan -> indéterminé")
             elif pd.isna(v_gmm):
@@ -414,12 +322,9 @@ def compare_gmm_vs_gan(real: pd.DataFrame, synth_gmm: pd.DataFrame,
     return df_cmp
 
 
+# Compares GMM's and CTGAN's correlation matrices against the real one, side by side.
 def compare_correlation_matrices(real: pd.DataFrame, synth_gmm: pd.DataFrame,
                                  synth_gan: pd.DataFrame, features: List[str]) -> Optional[pd.DataFrame]:
-    """
-    Compare correctement les matrices de corrélation réel/GMM/GAN pour N
-    features (remplace les colonnes Corr_* buguées de compare_gmm_vs_gan).
-    """
     if len(features) < 2:
         return None
 
@@ -461,10 +366,8 @@ def compare_correlation_matrices(real: pd.DataFrame, synth_gmm: pd.DataFrame,
     return pd.DataFrame(rows)
 
 
-# ----------------------------------------------------------------------
-# MAIN
-# ----------------------------------------------------------------------
-
+# Entry point: load real data, preprocess, train (or load) CTGAN, generate
+# synthetic data, postprocess, validate, and save results.
 def main():
     args = parse_args()
     np.random.seed(args.random_state)
@@ -491,7 +394,6 @@ def main():
 
     data_transformed, caps, real_clean = preprocess(benign_df, features, args.fit_clip_quantile)
 
-    # --- Chargement ou réentraînement ---
     ctgan = None
     cached_caps = None
     if not args.force_retrain and os.path.exists(args.model_path):
@@ -499,7 +401,6 @@ def main():
         if ctgan is not None:
             print(f"\n[INFO] Modèle existant chargé depuis {args.model_path} "
                   f"(--force-retrain pour réentraîner)")
-            # Les caps du modele en cache priment (coherence avec les poids entraines)
             if cached_caps:
                 caps = cached_caps
         else:
@@ -525,7 +426,6 @@ def main():
             pickle.dump(payload, f)
         print(f"\n[INFO] Modèle sauvegardé -> {args.model_path}")
 
-    # --- Génération ---
     print(f"\n[INFO] Génération de {args.n_synthetic} flux synthétiques...")
     try:
         synth_log = ctgan.sample(args.n_synthetic)
@@ -550,7 +450,6 @@ def main():
     val_results.to_csv("validation_gan.csv", index=False)
     print(f"\n[INFO] Résultats de validation exportés -> validation_gan.csv")
 
-    # --- Comparaison GMM vs GAN ---
     gmm_path = args.gmm_csv
     if os.path.exists(gmm_path):
         print(f"\n[INFO] Chargement GMM depuis {gmm_path} pour comparaison...")
@@ -576,10 +475,6 @@ def main():
 
     print("\nTerminé.")
 
-
-# ----------------------------------------------------------------------
-# GESTION PROPRE DU CTRL‑C
-# ----------------------------------------------------------------------
 
 if __name__ == "__main__":
     try:
